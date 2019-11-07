@@ -1,0 +1,1931 @@
+var endLine = require('os').EOL;
+var express = require('express');
+var forge = require('node-forge');
+var router = express.Router();
+
+var gedcomParser = require('./gedcomParser');
+var budgetBackend = require('./budgetBackend');
+const formidable = require('formidable');
+
+const { Pool } = require('pg');
+
+//const pool = new Pool({
+//	user: 'entreos',
+//	host: '192.168.1.26',
+//	database: 'entreoside',
+//	password: '$illy$alamander',
+//	port: 5432,
+//});
+
+const pool = new Pool({
+    user: 'superbrosey',
+    host: '192.168.1.127',
+    database: 'broseybase',
+    password: '$illy$alamander',
+    port: 5432
+});
+
+const authenticateToken = `
+	SELECT u.userid,
+		u.username,		
+		u.admin,
+		u.poweruser
+		FROM BroseyEnterprises.auth_tokens at
+			LEFT JOIN BroseyEnterprises.users u
+				ON at.userid = u.userid
+		WHERE at.token = $1
+			AND at.active IS TRUE`;
+
+const authenticateUser = `
+	SELECT userid
+		FROM BroseyEnterprises.users
+		WHERE username = $1
+			AND password = CRYPT($2, password);`;
+
+const changePassword = `
+    UPDATE BroseyEnterprises.users
+        SET password = CRYPT($2, gen_salt('bf'))
+        WHERE username = $1;`;
+
+const insertToken = `
+	INSERT INTO BroseyEnterprises.auth_tokens (
+		token,
+		userid,
+		expires,
+		created,
+        active)
+		VALUES (
+			$1,
+			$2,
+			1234,
+			1234,
+            true)
+		RETURNING token;`;
+
+const insertUser = `
+	INSERT INTO BroseyEnterprises.users (
+		username,
+		password,
+		admin,
+		poweruser)
+		VALUES (
+			$1,
+			CRYPT($2, gen_salt('bf')),
+			$3,
+			$4);`;
+
+const removeUser = `
+    DELETE FROM BroseyEnterprises.users
+        WHERE username = $1`;
+
+const selectUserIsAdmin = `
+    SELECT u.admin AS admin,
+        u.poweruser AS poweruser
+        FROM BroseyEnterprises.auth_tokens at
+            LEFT JOIN BroseyEnterprises.users u
+                ON at.userid = u.userid
+        WHERE at.token = $1
+            AND at.active IS TRUE
+        LIMIT 1;`;
+
+const selectUserList = `
+    SELECT DISTINCT u.username AS username,
+        u.admin AS admin,
+        u.poweruser AS poweruser
+        FROM BroseyEnterprises.users u;`;
+
+var authmiddle = function(req, res, next) {
+	if (req.method == "OPTIONS" || req.path == "/login" || req.path == "/") {
+		next();
+	} else {
+		pool.query(authenticateToken, [req.headers.authorization])
+			.then(dbres => {
+                if (dbres.rowCount > 0) {		
+                    req.userinfo = {
+					    userid: dbres.rows[0].userid,
+                        username: dbres.rows[0].username,
+                        admin: dbres.rows[0].admin,
+                        poweruser: dbres.rows[0].poweruser
+                    }
+                    next();
+                } else {
+                    res.sendStatus(403);
+                }
+            }).catch(e => {
+                console.log(e.stack);
+                res.sendStatus(403);
+            });
+    }
+};
+
+router.all('*', authmiddle);
+
+router.get('/', function(req, res, next) {
+    res.render('index');
+});
+
+router.post('/login', function (req, res, next) {
+    return pool.query(authenticateUser, [req.body.username, req.body.password])
+        .then(dbres => {
+            if (dbres.rowCount > 0) {
+                var date = new Date();
+                var messageDigest = forge.md.sha256.create();
+                messageDigest.update(req.body.username + date.getTime());
+                pool.query(insertToken, [messageDigest.digest().toHex(), dbres.rows[0].userid])
+                    .then(tokenres => {
+                        res.send({token: tokenres.rows[0].token});
+                    }).catch(e => {
+                        console.log(e.stack);
+                        res.sendStatus(500);
+                    });
+            } else {
+                res.sendStatus(403);
+            }
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(403);
+        });
+});
+
+router.get('/logout/', function(req, res, next) {
+
+});
+
+var isAdmin = function(req, res, next) {
+    if (req.userinfo.admin) {
+        next();
+    } else {
+        res.sendStatus(403);
+    }
+}
+
+var isPowerUser = function(req, res, next) {
+    if (req.userinfo.poweruser) {
+        next();
+    } else {
+        res.sendStatus(403);
+    }
+}  
+
+router.get('/', function(req, res, next) {
+    res.render('index', {title: 'Express' });
+});
+
+function LoadProject(req, res, next, name) {
+    return pool.query(`
+        SELECT *
+            FROM Projects
+            WHERE Name = $1
+            LIMIT 1;`, [name])
+        .then(dbres => {
+            var projectId = dbres.rows[0].projectid;
+            LoadExplorerDirectories(req, res, next, projectId)
+                .then(r => {
+                    LoadExplorerAppendFiles(req, res, next, projectId, r)
+                        .then(s => {
+                            var item = s;
+                            res.send(s);
+                        }).catch(e => {
+                            console.log(e.stack);
+                            res.sendStatus(500);
+                        });
+                }).catch(e => {
+                    console.log(e.stack);
+                    res.sendStatus(500);
+                });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadExplorerDirectories(req, res, next, projectId) {
+    return new Promise((resolve, reject) => {
+        pool.query(`
+            SELECT f.FileId AS fileid,
+                f.Name AS filename,
+                f.Type AS filetype,
+                fh.FileHierarchyId AS filehierarchyid,
+                fh.ParentId AS parentid
+                FROM FileHierarchy fh
+                    INNER JOIN Files f
+                        ON fh.FileId = f.FileId
+                WHERE fh.ProjectId = $1
+                    AND fh.ParentId = 0;`, [projectId])
+            .then(dbres => {
+                var item = [];
+                dbres.rows.forEach(r => {
+                    item.push({
+                        "name": r.filename,
+                        //"file": r.filetype,
+                        "filetype": r.filetype,
+                        "fileid": r.fileid,
+                        "filehierarchyid": r.filehierarchyid,
+                        "parentid": r.parentid,
+                        "children": []
+                    });
+                });
+                resolve(item);        
+            }).catch(e => {
+                reject(e);
+            });
+    });
+}
+
+function LoadExplorerAppendFiles(req, res, next, projectId, fileHierarchy) {
+    return new Promise((resolve, reject) => {
+        pool.query(`
+            SELECT f.FileId AS fileid,
+                f.Name AS filename,
+                f.Type AS filetype,
+                fh.FileHierarchyId AS filehierarchyid,
+                fh.ParentId AS parentid
+                FROM FileHierarchy fh
+                    INNER JOIN Files f
+                        ON fh.FileId = f.FileId
+                WHERE fh.ProjectId = $1
+                    AND fh.ParentId != 0
+                ORDER BY fh.ParentId,
+                    f.Name;`, [projectId])
+            .then(dbres => {
+                dbres.rows.forEach(r => {
+                    for(var i = 0; i < fileHierarchy.length; i++) {
+                        console.log("fileHierarchy[i].filehierarchyid: " 
+                            + fileHierarchy[i].filehierarchyid);
+                        console.log("r.parentid: " + r.parentid);
+                        if (fileHierarchy[i].filehierarchyid == r.parentid) {
+                            console.log("Pushing child...");
+                            fileHierarchy[i].children.push({
+                                "fileid": r.fileid,
+                                "filehierarchyid": r.filehierarchyid,
+                                "name": r.filename,
+                                "file": r.filetype,    
+                                "filetype": r.filetype,
+                                "parentid": r.parentid
+                            });
+                        }
+                    }
+                });
+                resolve(fileHierarchy);
+            }).catch(e => {
+                reject(e);
+            });
+    });
+}
+
+function LoadExplorer(req, res, next, projectId) {
+    let result;    
+    pool.query(`
+        SELECT f.FileId AS fileid,
+            f.Name AS filename,
+            f.Type AS filetype,
+            fh.ParentId AS parentid
+            FROM FileHierarchy fh
+                INNER JOIN Files f
+                    ON fh.FileId = f.FileId
+            WHERE fh.ProjectId = $1
+                AND f.Type = 'Directory';`, [projectId])
+        .then(dbres => {
+            var item = [];
+            dbres.rows.forEach(r => {
+                item.push({
+                    "name": r.filename,
+                    "filetype": r.filetype,
+                    "fileid": r.fileid,
+                    "parentid": r.parentid,
+                    "children": []
+                });
+            });
+            pool.query(`
+                SELECT f.FileId AS fileid,
+                    f.Name AS filename,
+                    f.Type AS filetype,
+                    fh.ParentId AS parentid
+                    FROM FileHierarchy fh
+                        INNER JOIN Files f
+                            ON fh.FileId = f.FileId
+                    WHERE fh.ProjectId = $1
+                        AND f.Type != 'Directory'
+                    ORDER BY fh.ParentId,
+                        f.Name;`, [projectId])
+                .then(dbres => {
+                    dbres.rows.forEach(r => {
+                        for(var i = 0; i < item.length; i++) {
+                            if (item[i].fileid === r.parentid) {
+                                item[i].children.push({
+                                    "name": r.filename,
+                                    "file": r.filetype,
+                                    "filetype": r.filetype,
+                                    "parentid": r.parentid
+                                });
+                            }
+                        }
+                    });
+                    console.log(item);
+                    result = new Promise((resolve, reject) => {
+                        resolve(item);
+                    });
+                    console.log("Result1: " + result);
+                    return result;
+                });
+            console.log("Result2: " + result);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+    //console.log("Result3: " + result);
+    //return result;
+}
+
+function CreateDirectory(req, res, next, projectId, name) { 
+    return pool.query(`
+        INSERT INTO Files (
+            Name,
+            Type)
+            VALUES (
+                $1,
+                'Directory')
+            RETURNING FileId;`, [name])
+        .then(dbres => {
+            var fileId = dbres.rows[0].fileid;
+            pool.query(`
+                INSERT INTO FileHierarchy (
+                    FileId,
+                    ProjectId,
+                    ParentId)
+                    VALUES (
+                        $1,
+                        $2,
+                        0)`, [fileId, projectId])
+                .then(dbres => {
+                    
+                }).catch(e => {
+                    console.log(e.stack);
+                    res.sendStatus(500);
+                });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadProjectNames(req, res, next) {
+    return pool.query(`
+        SELECT name
+            FROM Projects
+            ORDER BY name`, [])
+        .then(dbres => {
+            var item = [];
+            dbres.rows.forEach((r) => {
+                item.push(r.name);
+            });
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+router.post('/loadsourcefile/', function(req, res, next) {
+    pool.query(`
+        SELECT FileText AS filetext
+            FROM Files
+            WHERE FileId = $1;`, [req.body.fileId])
+        .then(dbres => {
+            var item = dbres.rows[0].filetext;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/savesourcefile/', function(req, res, next) {
+    console.log("FileId: " + req.body.fileId);
+    pool.query(`
+        UPDATE Files
+            SET FileText = $1
+            WHERE FileId = $2;`, [
+                req.body.sourceText,
+                req.body.fileId])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/createprojectfile/', function(req, res, next) {
+    pool.query(`
+        INSERT INTO Files (
+            Name,
+            Type)
+            VALUES (
+                $1,
+                $2)
+            RETURNING fileid;`, [
+                req.body.fileName,
+                req.body.directory])
+        .then(dbres => {
+            pool.query(`
+                INSERT INTO FileHierarchy (
+                    FileId,
+                    ProjectId,
+                    ParentId)
+                    VALUES (
+                        $1,
+                        (SELECT ProjectId
+                            FROM Projects
+                            WHERE Name = $2),
+                        (SELECT FileHierarchyId
+                            FROM FileHierarchy fh
+                                INNER JOIN Files f
+                                    ON fh.FileId = f.FileId
+                                INNER JOIN Projects p
+                                    ON fh.ProjectId = p.ProjectId
+                            WHERE p.Name = $2
+                                AND f.Name = $3));`, [
+                            dbres.rows[0].fileid,
+                            req.body.projectName,
+                            req.body.directory])
+                    .then(dbres => {
+                        LoadProject(req, res, next, req.body.projectName);
+                    }).catch(e => {
+                        console.log(e.stack);
+                        res.sendStatus(500);
+                    });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+function SetRefreshUXFlag (projectName) {
+    return pool.query(`
+        INSERT INTO ProjectFlags (
+            ProjectId,
+            RefreshUX)
+            SELECT (
+                SELECT ProjectId
+                    FROM Projects
+                    WHERE Name = $1), 't'
+            WHERE NOT EXISTS (
+                SELECT 1
+                    FROM ProjectFlags
+                    WHERE ProjectId = (
+                        SELECT ProjectId
+                            FROM Projects
+                            WHERE Name = $1))
+            RETURNING ProjectFlagId;`, [projectName])
+        .then(dbres => {
+            if (dbres.rows === undefined) {
+                pool.query(`
+                    UPDATE ProjectFlags
+                        SET RefreshUX = 't'
+                        WHERE ProjectId = (
+                            SELECT ProjectId
+                                FROM Projects
+                                WHERE Name = $1)`, [projectName])
+                    .then(dbres => {
+
+                    }).catch(e => {
+                        console.log(e.stack);
+                        res.sendStatus(500);
+                    });
+            }
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function CompileSchemas (projectName) {
+    return pool.query(`
+        SELECT fh.filehierarchyid,
+            f.fileid,
+            fh.projectid,
+            fh.parentid,
+            f.name,
+            f.filejson,
+            f.fileblob,
+            f.filetext
+            FROM FileHierarchy fh
+                INNER JOIN f
+                    ON fh.fileid = f.fileid
+            WHERE fh.projectid = (
+                SELECT projectid
+                    FROM Projects
+                    WHERE name = $1)
+                AND fh.parentid = (
+                    SELECT fh.fileid
+                        FROM filehierarchy fh
+                            INNER JOIN files f
+                                ON fh.fileid = f.fileid
+                        WHERE fh.projectid = (
+                            SELECT projectid
+                                FROM Projects
+                                WHERE name = $1)
+                            AND f.name = 'Data')`, [projectName])
+        .then(dbres => {
+            dbres.rows.forEach(r => {
+                
+            });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        }); 
+}
+
+function ParseSchemaMarkup (schemaMarkup, dropExistingSchema) {
+    let result = [];
+    
+    let lineNumber = 1;
+    let currentBuffer = '';
+    let currentDataRecord = [];
+    let currentDataRecordPrefix = '';
+    let currentEntity = '';
+    let currentFields = [];
+    let currentSchema = '';
+    let currentStatus = 'InFile';
+    let currentType = '';
+    let pleaseContinue = false;
+    let tabIndex = '';
+    let statusStack = [];
+    let temporaryString = '';
+    let userDefinedTypes = [];
+    const postgresTypes = ['BOOLEAN', 'INTEGER', 'TEXT'];
+    for (var i = 0; i < schemaMarkup.length; i++) {
+        if (schemaMarkup.charAt(i) === '\n') {
+            lineNumber += 1;
+            if (currentStatus === 'InValue') {
+                result[result.length - 1] += 
+                    tabIndex + currentBuffer.trim() + " " + currentType + "," + endLine;
+                currentFields.push(currentBuffer.trim());
+                currentStatus = statusStack.pop();
+            }
+            currentBuffer = '';
+        }
+        else if (schemaMarkup.charAt(i) === ':') {
+            if (currentStatus === 'InDataRecordValue') {
+                currentBuffer += ':';
+            }
+            else if (currentBuffer.trim().toLowerCase() === 'schema') {
+                statusStack.push(currentStatus);
+                currentStatus = 'AtSchema';
+                currentBuffer = '';
+            }
+            else if (currentBuffer.trim().toLowerCase() === 'entity') {
+                statusStack.push(currentStatus);
+                currentStatus = 'AtEntity';
+                currentBuffer = '';
+            }
+            else if (currentBuffer.trim().toLowerCase() === 'data') {
+                console.log("Switching to InData");
+                if (currentStatus === 'InEntity') {
+                    result[result.length - 1] = 
+                        result[result.length - 1].substring(
+                            0, result[result.length - 1].length - 2);
+                    result[result.length - 1] += ");"
+                    tabIndex = tabIndex.substring(0, tabIndex.length - 4);
+                    currentStatus = statusStack.pop();
+                }
+                statusStack.push(currentStatus);
+                currentStatus = 'InData';
+                currentBuffer = '';
+            }
+            else if (postgresTypes.indexOf(currentBuffer.trim().toUpperCase()) >= 0) {
+                statusStack.push(currentStatus);
+                currentStatus = 'InValue';
+                currentType = currentBuffer.trim().toUpperCase();
+                currentBuffer = '';
+            }
+            else if (userDefinedTypes.indexOf(currentBuffer.trim().toUpperCase()) >= 0) {
+                statusStack.push(currentStatus);
+                currentStatus = 'InValue';
+                currentType = currentBuffer.trim().toUpperCase();
+                currentBuffer = '';
+            }
+            else {
+                //Syntax error. Unknown type.
+            }
+        }
+        else if (schemaMarkup.charAt(i) === "'") {
+            if (currentStatus === 'InDataRecord') {
+                statusStack.push(currentStatus);
+                currentStatus = 'InDataRecordValue';
+                currentBuffer = '';
+            }
+            else if (currentStatus === 'InDataRecordValue') {
+                pleaseContinue = false;
+                if (schemaMarkup.length >= i + 1) {
+                    if (schemaMarkup.charAt(i + 1) !== "'") {
+                        pleaseContinue = true;
+                    }
+                    else {
+                        currentBuffer += "''";
+                        i += 1;
+                    }
+                }
+                else {
+                    pleaseContinue = true;
+                }
+                
+                if (pleaseContinue) {
+                    console.log("Pushing value: " + currentBuffer.trim());
+                    currentDataRecord.push(currentBuffer.trim());
+                    currentStatus = statusStack.pop();
+                    currentBuffer = '';
+                    tabIndex = tabIndex.substring(tabIndex.length - 4);
+                }
+            }
+        }
+        else if (schemaMarkup.charAt(i) === ',') {
+
+        }
+        else if (schemaMarkup.charAt(i) === ';') {
+            if (currentStatus === 'InDataRecord') {
+                temporaryString = '';
+                for(var j = 0; j < currentDataRecord.length; j++) {
+                    temporaryString += "'" + currentDataRecord[j] + "', ";
+                }
+                temporaryString 
+                    = temporaryString.substring(0, temporaryString.length - 2) + ";";
+                console.log("Pushing currentDataRecord: " + temporaryString);
+                result.push(
+                    currentDataRecordPrefix + endLine
+                        + tabIndex + "SELECT " + temporaryString);
+                currentDataRecord = [];
+                currentBuffer = '';
+            }
+        }
+        else if (schemaMarkup.charAt(i) === '{') {
+            if (currentStatus === 'AtSchema') {
+                currentSchema = currentBuffer.trim();
+                currentStatus = 'InSchema';
+                if (dropExistingSchema) {
+                    result.push("DROP SCHEMA " + currentSchema + " CASCADE;");
+                }
+                result.push("CREATE SCHEMA IF NOT EXISTS " + currentSchema + ";");
+                currentBuffer = '';
+            }
+            else if (currentStatus === 'AtEntity') {
+                currentEntity = currentBuffer.trim();
+                currentStatus = 'InEntity';
+                tabIndex += '    ';
+                result.push(
+                    "CREATE TABLE IF NOT EXISTS " 
+                        + currentSchema + "." + currentEntity + " (" + endLine
+                        + tabIndex + currentEntity + "Id SERIAL PRIMARY KEY, " + endLine);
+                currentFields = [];
+                currentBuffer = '';
+            }
+            else if (currentStatus === 'InData') {
+                console.log("Switching to InDataRecord");
+                currentStatus = 'InDataRecord';
+                tabIndex += '    ';
+                temporaryString = '';
+                for(var j = 0; j < currentFields.length; j++) {
+                    temporaryString += currentFields[j] + ", ";
+                }
+                temporaryString 
+                    = temporaryString.substring(0, temporaryString.length - 2) + ")";
+                currentDataRecordPrefix = 
+                    "INSERT INTO " + currentSchema + "." + currentEntity + " (" + endLine
+                        + tabIndex + temporaryString;
+                currentBuffer = '';
+            }
+            else {
+                //Syntax error. Curly brace in strange place.
+            }
+        }
+        else if (schemaMarkup.charAt(i) === '}') {
+            if (currentStatus === 'InEntity') {
+                result[result.length - 1] = 
+                    result[result.length - 1].substring(
+                        0, result[result.length - 1].length - 2);
+                result[result.length - 1] += ");"
+                tabIndex = tabIndex.substring(0, tabIndex.length - 4);
+            }
+            currentStatus = statusStack.pop();
+            currentBuffer = '';
+        }
+        else {
+            currentBuffer += schemaMarkup.charAt(i);
+        }
+    }
+
+    //result.forEach(r => {
+    //    console.log(r);
+    //    pool.query(r, []).then(dbres => {}).catch(e => {
+    //        console.log(e.stack);
+    //    });
+    //});
+
+    for (var i = 0; i < result.length; i++) {
+        console.log(result[i] + endLine);
+    }
+
+    pool.query(result.join(endLine), []).then(dbres => {}).catch(e => {
+        console.log(e.stack);
+    });
+}
+
+router.post('/compileproject/', function(req, res, next) {
+    SetRefreshUXFlag(req.body.projectname);
+    CompileSchemas(req.body.projectname);
+});
+
+router.post('/insertproject/', function(req, res, next) {
+    pool.query(`
+        INSERT INTO Projects (
+            Name)
+            VALUES (
+                $1)
+            RETURNING projectid;`, [req.body.projectName])
+        .then(dbres => {
+            var projectId = dbres.rows[0].projectid;
+            CreateDirectory(req, res, next, projectId, 'Configuration');
+            CreateDirectory(req, res, next, projectId, 'Data');
+            CreateDirectory(req, res, next, projectId, 'Events');
+            CreateDirectory(req, res, next, projectId, 'Logic');
+            CreateDirectory(req, res, next, projectId, 'Markup');
+            LoadProjectNames(req, res, next);       
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/loadproject/', function(req, res, next) {
+    LoadProject(req, res, next, req.body.projectname);
+});
+
+router.post('/loadprojects/', function(req, res, next) {
+    LoadProjectNames(req, res, next);
+});
+
+router.post('/users/', isAdmin, function(req, res, next) {
+    console.log("Username: " + req.userinfo.username);
+    console.log("IsAdmin: " + req.userinfo.admin);
+    console.log("IsPowerUser: " + req.userinfo.poweruser);
+    pool.query(selectUserList, [])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/userinsert/', isAdmin, function(req, res, next) {
+    pool.query(insertUser, [
+        req.body.username,
+        req.body.password,
+        req.body.isadmin,
+        req.body.ispoweruser
+    ]).then(dbres => {
+        pool.query(selectUserList, [])
+            .then(dbres => {
+                var item = dbres.rows;
+                res.send(item);
+            }).catch(e => {
+                console.log(e.stack);
+                res.sendStatus(500);
+            });
+    }).catch(e => {
+        console.log(e.stack);
+        res.sendStatus(500);
+    });
+});
+
+router.post('/changepassword/', isAdmin, function(req, res, next) {
+    pool.query(changePassword, [req.body.username, req.body.password])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/removeuser/', isAdmin, function(req, res, next) {
+    pool.query(removeUser, [req.body.username])
+        .then(dbres => {
+            pool.query(selectUserList, [])
+                .then(dbres => {
+                    var item = dbres.rows;
+                    res.send(item);
+                }).catch(e => {
+                    console.log(e.stack);
+                    res.sendStatus(500);
+                });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+router.post('/isadmin/', function(req, res, next) {
+    pool.query(selectUserIsAdmin, [req.body.token])
+        .then(dbres => {
+            res.send({
+                admin: dbres.rows[0].admin,
+                poweruser: dbres.rows[0].poweruser });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+});
+
+// Brosey Enterprises Disk Copy
+
+router.post('/diskcopy/insertdiskcontainer/', isAdmin, function(req, res, next) {
+    console.log(req.body);    
+    InsertDiskContainer(res, req.body);
+});
+
+router.post('/diskcopy/loaddiskcontainers/', function(req, res, next) {
+    LoadDiskContainers(res);
+});
+
+router.post('/diskcopy/loadmediatypes/', function(req, res, next) {
+    LoadMediaTypes(res);
+});
+
+router.post('/diskcopy/updatediskcontainer/', isAdmin, function(req, res, next) {
+    UpdateDiskContainer(res, req.body);
+});
+
+function InsertDiskContainer (res, diskContainer) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.DiskContainers (
+            Title,
+            Contents,
+            MediaTypeId)
+            VALUES (
+                $1,
+                $2,
+                (SELECT MediaTypeId
+                    FROM BroseyEnterprises.MediaTypes
+                    WHERE MediaType = $3));`, [
+        diskContainer.title,
+        diskContainer.contents,
+        diskContainer.mediatype])
+        .then(dbres => {
+            LoadDiskContainers(res);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+} 
+
+function LoadDiskContainers (res) {
+    return pool.query(`
+        SELECT dc.DiskContainerId,
+            dc.Title,
+            dc.Contents,
+            mt.MediaType
+            FROM BroseyEnterprises.DiskContainers dc
+                INNER JOIN BroseyEnterprises.MediaTypes mt
+                    ON dc.MediaTypeId = mt.MediaTypeId
+            ORDER BY dc.Title;`, [])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateDiskContainer (res, diskContainer) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.DiskContainers dc
+            SET dc.Title = $1,
+                dc.Contents = $2,
+                dc.MediaTypeId = (
+                    SELECT MediaTypeId
+                        FROM BroseyEnterprises.MediaTypes
+                        WHERE MediaType = $3)
+            WHERE dc.DiskContainerId = $4;`, [
+        diskContainer.title,
+        diskContainer.contents,
+        diskContainer.mediatype,
+        diskContainer.diskcontainerid])
+        .then(dbres => {
+            
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadMediaTypes (res) {
+    return pool.query(`
+        SELECT mt.MediaType
+            FROM BroseyEnterprises.MediaTypes mt
+            ORDER BY MediaType;`, [])
+        .then(dbres => {
+            var item = [];
+            for(var i = 0; i < dbres.rows.length; i++) {
+                item.push(dbres.rows[i].mediatype);
+            }
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+// End Brosey Enterprises Disk Copy
+
+// Brosey Enterprises Recipes
+
+router.post('/recipes/insertrecipe/', function (req, res, next) {
+    console.log(req.body);
+    InsertRecipe(res, req.body); 
+});
+
+router.post('/recipes/loadrecipes/', function (req, res, next) {
+    LoadRecipes(res);
+});
+
+router.post('/recipes/loadrecipe/', function(req, res, next) {
+    LoadRecipe(res, req.body.recipeid);
+});
+
+router.post('/recipes/updaterecipe/', function (req, res, next) {
+    UpdateRecipe(res, req.body);
+});
+
+function InsertRecipe (res, recipe) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.Recipes (
+            Title,
+            Source,
+            SourceDescription,
+            RecipeText)
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4);`, [
+        recipe.title,
+        recipe.source,
+        recipe.sourcedescription,
+        recipe.recipetext])
+        .then(dbres => {
+            LoadRecipes(res);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadRecipes (res) {
+    return pool.query(`
+        SELECT recipeid,
+            title,
+            source,
+            sourcedescription,
+            recipetext
+            FROM BroseyEnterprises.Recipes
+            ORDER BY title;`, [])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadRecipe (res, recipeId) {
+    return pool.query(`
+        SELECT recipeid,
+            title,
+            source,
+            sourcedescription,
+            recipetext
+            FROM BroseyEnterprises.Recipes
+            WHERE RecipeId = $1;`, [
+        recipeId])
+        .then(dbres => {
+            res.send({
+                recipeid: dbres.rows[0].recipeid,
+                title: dbres.rows[0].title,
+                source: dbres.rows[0].source,
+                sourcedescription: dbres.rows[0].sourcedescription,
+                recipetext: dbres.rows[0].recipetext
+            });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateRecipe (res, recipe) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.Recipes
+            SET title = $1,
+                source = $2,
+                sourcedescription = $3,
+                recipetext = $4
+            WHERE recipeid = $5;`, [
+        recipe.title,
+        recipe.source,
+        recipe.sourcedescription,
+        recipe.recipetext,
+        recipe.recipeid])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+// End Brosey Enterprises Recipes
+
+// Brosey Enterprises Time Tracking
+
+router.post('/timetracking/insertsprint/', function (req, res, next) {
+    InsertSprint(res, req.userinfo, req.body);
+});
+
+router.post('/timetracking/loadsprint/', function (req, res, next) {
+    LoadSprint(res, req.userinfo, req.body.sprintid);
+});
+
+router.post('/timetracking/loadsprints/', function (req, res, next) {
+    LoadSprints(res, req.userinfo);
+});
+
+router.post('/timetracking/loadsprintdashboard/', function (req, res, next) {
+    LoadSprintDashboard(res, req.userinfo, req.body.sprintid);
+});
+
+router.post('/timetracking/updatesprint/', function (req, res, next) {
+    UpdateSprint(res, req.body);
+});
+
+router.post('/timetracking/loadtasktypes/', function (req, res, next) {
+    LoadTaskTypes(res);
+});
+
+router.post('/timetracking/inserttimeentry/', function (req, res, next) {
+    InsertTimeEntry(res, req.body);
+});
+
+router.post('/timetracking/loadtimeentries/', function (req, res, next) {
+    LoadTimeEntries(res, req.body.sprintid);
+});
+
+router.post('/timetracking/updatetimeentry/', function (req, res, next) {
+    UpdateTimeEntry(res, req.body);
+});
+
+router.post('/timetracking/removetimeentry/', function (req, res, next) {
+    DeleteTimeEntry(res, req.userinfo, req.body.timeentryid);
+});
+
+function InsertSprint (res, userinfo, sprint) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.Sprints (
+            UserId,
+            SprintName,
+            DateRange)
+            VALUES (
+                $1,
+                $2,
+                $3);`, [
+        userinfo.userid,
+        sprint.sprint_name,
+        sprint.date_range])
+        .then(dbres => {
+            LoadSprints(res, userinfo);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadSprint (res, userinfo, sprintId) {
+    return pool.query(`
+        SELECT SprintId AS sprintid,
+            SprintName AS sprint_name,
+            DateRange AS date_range
+            FROM BroseyEnterprises.Sprints
+            WHERE SprintId = $1
+                AND UserId = $2;`, [
+        sprintId,
+        userinfo.userid])
+        .then(dbres => {
+            res.send({
+                sprintid: dbres.rows[0].sprintid,
+                sprint_name: dbres.rows[0].sprint_name,
+                date_range: dbres.rows[0].date_range
+            });
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadSprints (res, userinfo) {
+    return pool.query(`
+        SELECT SprintId AS sprintid,
+            SprintName AS sprint_name,
+            DateRange AS date_range
+            FROM BroseyEnterprises.Sprints
+            WHERE UserId = $1;`, [
+        userinfo.userid])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadSprintDashboard (res, userinfo, sprintId) {
+    return pool.query(`
+        SELECT Prefix AS prefix,
+            Time AS time
+            FROM BroseyEnterprises.TimeEntries te
+                INNER JOIN BroseyEnterprises.Sprints s
+                    ON te.SprintId = s.SprintId
+                INNER JOIN BroseyEnterprises.TaskTypes tt
+                    ON te.TaskTypeId = tt.TaskTypeId
+            WHERE s.SprintId = $1
+                AND s.UserId = $2
+            ORDER BY prefix;`, [
+        sprintId,
+        userinfo.userid])
+        .then(dbres => {
+            var item = {
+                "CLN": 0, 
+                "DEV": 0,
+                "EXC": 0,
+                "LRN": 0,
+                "ORG": 0,
+                "PUB": 0,
+                "REL": 0,
+                "SPR": 0,
+                "TOT": 0,
+                "PLAY": 0,
+                "SLEEP": 0
+            };
+            dbres.rows.forEach(r => {
+                var timeArray = r.time.split(':');
+                var totalMinutes = (parseInt(timeArray[0]) * 60) + parseInt(timeArray[1]);
+                if (r.prefix === 'CLN') {
+                    item.CLN += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'DEV') {
+                    item.DEV += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'EXC') {
+                    item.EXC += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'LRN') {
+                    item.LRN += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'ORG') {
+                    item.ORG += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'PUB') {
+                    item.PUB += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'REL') {
+                    item.REL += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'SPR') {
+                    item.SPR += totalMinutes;
+                    item.TOT += totalMinutes;
+                }
+                else if (r.prefix === 'PLAY') {
+                    item.PLAY += totalMinutes;
+                }
+                else if (r.prefix === 'SLEEP') {
+                    item.SLEEP += totalMinutes;
+                }
+            });
+            item.CLN = parseInt(item.CLN/60);
+            item.DEV = parseInt(item.DEV/60);
+            item.EXC = parseInt(item.EXC/60);
+            item.LRN = parseInt(item.LRN/60);
+            item.ORG = parseInt(item.ORG/60);
+            item.PUB = parseInt(item.PUB/60);
+            item.REL = parseInt(item.REL/60);
+            item.SPR = parseInt(item.SPR/60);
+            item.TOT = parseInt(item.TOT/60);
+            item.PLAY = parseInt(item.PLAY/60);
+            item.SLEEP = parseInt(item.SLEEP/60);
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateSprint (res, sprint) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.Sprints
+            SET SprintName = $1,
+                DateRange = $2
+            WHERE SprintId = $3;`, [
+        sprint.sprint_name,
+        sprint.date_range,
+        sprint.sprintid])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadTaskTypes (res) {
+    return pool.query(`
+        SELECT Description AS description
+            FROM BroseyEnterprises.TaskTypes
+            ORDER BY description;`, [])
+        .then(dbres => {
+            var item = [];
+            dbres.rows.forEach((r) => {
+                item.push(r.description);
+            });
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function DeleteTimeEntry (res, userinfo, timeEntryId) {
+    return pool.query(`
+        DELETE FROM BroseyEnterprises.TimeEntries te
+            WHERE te.TimeEntryId = $1
+                AND EXISTS (
+                    SELECT TimeEntryId 
+                        FROM BroseyEnterprises.TimeEntries tes
+                            INNER JOIN BroseyEnterprises.Sprints ss
+                                ON tes.SprintId = ss.SprintId
+                        WHERE tes.TimeEntryId = $1
+                            AND ss.UserId = $2)
+            RETURNING te.SprintId;`, [
+        timeEntryId,
+        userinfo.userid])
+        .then(dbres => {
+            LoadTimeEntries(res, dbres.rows[0].sprintid); 
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertTimeEntry (res, timeEntry) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.TimeEntries (
+            SprintId,
+            Day,
+            Task,
+            TaskTypeId,
+            Description,
+            Time)
+            VALUES (
+                $1,
+                $2,
+                $3,
+                (SELECT TaskTypeId
+                    FROM BroseyEnterprises.TaskTypes
+                    WHERE Description = $4),
+                $5,
+                $6);`, [
+        timeEntry.sprintid,
+        timeEntry.day,
+        timeEntry.task,
+        timeEntry.tasktype,
+        timeEntry.description,
+        timeEntry.time])
+        .then(dbres => {
+            LoadTimeEntries(res, timeEntry.sprintid);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadTimeEntries (res, sprintId) {
+    return pool.query(`
+        SELECT TimeEntryId AS timeentryid,
+            Day AS day,
+            Task AS task,
+            tt.Description AS tasktype,
+            te.Description AS description,
+            Time AS time
+            FROM BroseyEnterprises.TimeEntries te
+                INNER JOIN BroseyEnterprises.TaskTypes tt
+                    ON te.TaskTypeId = tt.TaskTypeId
+            WHERE sprintid = $1;`, [
+        sprintId])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateTimeEntry (res, timeEntry) {
+    console.log(timeEntry.tasktype);
+    return pool.query(`
+        UPDATE BroseyEnterprises.TimeEntries
+            SET Day = $1,
+                Task = $2,
+                TaskTypeId = (
+                    SELECT TaskTypeId
+                        FROM BroseyEnterprises.TaskTypes
+                        WHERE Description = $3),
+                Description = $4,
+                Time = $5
+            WHERE TimeEntryId = $6
+            RETURNING SprintId;`, [
+        timeEntry.day,
+        timeEntry.task,
+        timeEntry.tasktype,
+        timeEntry.description,
+        timeEntry.time,
+        timeEntry.timeentryid])
+        .then(dbres => {
+            LoadTimeEntries(res, dbres.rows[0].sprintid);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+// End Brosey Enterprises Time Tracking
+
+// Brosey Enterprises Item Catalog
+
+router.post('/librarycatalog/insertbook/', isAdmin, function(req, res, next) {
+    InsertBook(res, req.body);
+});
+
+router.post('/librarycatalog/loadbooks/', function(req, res, next) {
+    LoadBooks(res);
+});
+
+router.post('/librarycatalog/updatebook/', isAdmin, function(req, res, next) {
+    UpdateBook(res, req.body);
+});
+
+router.post('/librarycatalog/removeparticipantbookaction/', isAdmin, function(req, res, next) {
+    RemoveParticipantBookAction(res, req.body);
+    LoadParticipants(res, req.body.currentbookid);
+});
+
+router.post('/librarycatalog/loadbookparticipants/', function(req, res, next) {
+    LoadParticipants(res, req.body.bookid);
+});
+
+router.post('/librarycatalog/loadbookstatusvalues/', function(req, res, next) {
+    LoadBookStatusValues(res);
+});
+
+router.post('/librarycatalog/insertparticipant/', isAdmin, function(req, res, next) {
+    InsertOrUpdateParticipant(res, req.body);
+});
+
+router.post('/librarycatalog/updateparticipant/', isAdmin, function(req, res, next) {
+    UpdateParticipant(res, req.body);
+    InsertParticipantBookAction(res, req.body);
+});
+
+router.post('/librarycatalog/loadparticipantroles/', function(req, res, next) {
+    LoadParticipantRoles(res);
+});
+
+function InsertBook (res, book) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.Books (
+            Title,
+            Subtitle,
+            CopyrightDate,
+            CopyrightHolder,
+            PublicationDate,
+            Publisher,
+            LOCCardNumber,
+            DeweyDecimalNumber,
+            CurrentStatusId,
+            CurrentStatusDescription,
+            SubjectList,
+            Keywords,
+            Comments,
+            ShelfNumber)
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                (SELECT RecordId
+                    FROM BroseyEnterprises.BookStatus
+                    WHERE Status = $9),
+                $10,
+                $11,
+                $12,
+                $13,
+                $14)
+            RETURNING recordid;`, [
+            book.title,
+            book.subtitle,
+            book.copyrightdate,
+            book.copyrightholder,
+            book.publicationdate,
+            book.publisher,
+            book.loccardnumber,
+            book.deweydecimalnumber,
+            book.currentstatus,
+            book.currentstatusdescription,
+            book.subjectlist,
+            book.keywords,
+            book.comments,
+            book.shelfnumber])
+        .then(dbres => {
+            var item = dbres.rows[0];
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadBooks (res) {
+    return pool.query(`
+        SELECT b.RecordId AS bookid,
+            Title,
+            Subtitle,
+            CopyrightDate,
+            CopyrightHolder,
+            PublicationDate,
+            Publisher,
+            LOCCardNumber,
+            DeweyDecimalNumber,
+            bs.Status AS CurrentStatus,
+            CurrentStatusDescription,
+            SubjectList,
+            Keywords,
+            Comments,
+            ShelfNumber
+            FROM BroseyEnterprises.Books b
+                LEFT JOIN BroseyEnterprises.BookStatus bs
+                    ON b.CurrentStatusId = bs.RecordId
+            ORDER BY LOCCardNumber;`, [])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateBook (res, book) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.Books
+            SET Title = $1,
+                Subtitle = $2,
+                CopyrightDate = $3,
+                CopyrightHolder = $4,
+                PublicationDate = $5,
+                Publisher = $6,
+                LOCCardNumber = $7,
+                DeweyDecimalNumber = $8,
+                CurrentStatusId = (
+                    SELECT RecordId
+                        FROM BroseyEnterprises.BookStatus
+                        WHERE Status = $9),
+                CurrentStatusDescription = $10,
+                SubjectList = $11,
+                Keywords = $12,
+                Comments = $13,
+                ShelfNumber = $14
+            WHERE RecordId = $15;`, [
+            book.title,
+            book.subtitle,
+            book.copyrightdate,
+            book.copyrightholder,
+            book.publicationdate,
+            book.publisher,
+            book.loccardnumber,
+            book.deweydecimalnumber,
+            book.currentstatus,
+            book.currentstatusdescription,
+            book.subjectlist,
+            book.keywords,
+            book.comments,
+            book.shelfnumber,
+            book.bookid])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertBookStatus (res, bookstatus) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.BookStatus (
+            Status)
+            VALUES ($1);`, [bookstatus.status])
+        .then(dbres => {
+            
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateBookStatus (res, bookstatus) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.BookStatus
+            SET Status = $1
+            WHERE BookStatusId = $2;`, [
+        bookstatus.status,
+        bookstatus.bookstatusid])
+        .then(dbres => {
+            
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function RemoveBookStatus (res, bookstatus) {
+    return pool.query(`
+        DELETE FROM BroseyEnterprises.BookStatus
+            WHERE BookStatusId = $1;`, [bookstatus.bookstatusid])
+        .then(dbres => {
+
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertParticipant (res, participant) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.Participants (
+            ParticipantName,
+            Description)
+            VALUES (
+                $1,
+                $2)
+            RETURNING recordid;`, [
+            participant.name,
+            participant.description])
+        .then(dbres => {
+            var item = participant;
+            item.participantid = dbres.rows[0].recordid;
+            InsertParticipantBookAction(res, item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertOrUpdateParticipant (res, participant) {
+    return pool.query(`
+        SELECT recordid,
+            ParticipantName
+            FROM BroseyEnterprises.Participants
+            WHERE ParticipantName = $1;`, [
+        participant.name])
+        .then(dbres => {
+            if (dbres.rows.length != 0) {
+                console.log("Updating Participant...");
+                var item = participant;
+                item.participantid = dbres.rows[0].recordid;
+                UpdateParticipant(res, item);
+            } else {
+                console.log("Inserting Participant...");
+                InsertParticipant(res, participant);
+            }
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadParticipants (res, bookid) {
+    return pool.query(`
+        SELECT pba.BookId AS currentbookid,
+            pr.RecordId AS roleid,
+            pr.Role AS role,
+            pr.PastTenseWorkingText AS pasttenseworkingtext,
+            p.RecordId AS participantid,
+            p.ParticipantName AS name,
+            p.Description AS description
+            FROM BroseyEnterprises.ParticipantBookActions pba
+                INNER JOIN BroseyEnterprises.ParticipantRoles pr
+                    ON pba.ParticipantRoleId = pr.RecordId
+                INNER JOIN BroseyEnterprises.Participants p
+                    ON pba.ParticipantId = p.RecordId
+            WHERE BookId = $1
+            ORDER BY pr.Role;`, [
+        bookid])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UpdateParticipant (res, participant) {
+    return pool.query(`
+        UPDATE BroseyEnterprises.Participants
+            SET ParticipantName = $1,
+                Description = $2
+            WHERE RecordId = $3;`, [
+        participant.name,
+        participant.description,
+        participant.participantid])
+        .then(dbres => {
+            InsertParticipantBookAction(res, participant);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function RemoveParticipant (res, participant) {
+    return pool.query(`
+        DELETE FROM BroseyEnterprises.Participants
+            WHERE ParticipantId = $1;`, [participant.participantid])
+        .then(dbres => {
+
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertParticipantBookAction (res, participantbookaction) {
+    return pool.query(`
+        INSERT INTO BroseyEnterprises.ParticipantBookActions (
+            BookId,
+            ParticipantId,
+            ParticipantRoleId)
+            VALUES (
+                $1,
+                $2,
+                (SELECT recordid
+                    FROM BroseyEnterprises.ParticipantRoles
+                    WHERE Role = $3));`, [
+            participantbookaction.currentbookid,
+            participantbookaction.participantid,
+            participantbookaction.role])
+        .then(dbres => {
+            LoadParticipants(res, participantbookaction.currentbookid);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function RemoveParticipantBookAction (res, participantbookaction) {
+    return pool.query(`
+        DELETE FROM BroseyEnterprises.ParticipantBookActions
+            WHERE BookId = $1
+                AND ParticipantId = $2
+                AND ParticipantRoleId = $3;`, [
+        participantbookaction.currentbookid,
+        participantbookaction.participantid,
+        participantbookaction.participantroleid])
+        .then(dbres => {
+
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function BookSearch (searchCriteria) {
+    return pool.query(`
+        CREATE TEMPORARY TABLE searchByAuthor (
+            RecordId INTEGER);
+        CREATE TEMPORARY TABLE searchByKeyword (
+            RecordId INTEGER);
+        CREATE TEMPORARY TABLE searchByTitle (
+            RecordId INTEGER);
+
+        IF 1 = $1 THEN
+            INSERT INTO searchByKeyword
+                SELECT RecordId
+                FROM Books
+                WHERE SubjectList LIKE CONCAT('%', $4, '%')
+                    OR Keywords LIKE CONCAT('%', $4, '%')
+                    OR Comments LIKE CONCAT('%', $4, '%');
+        END IF;
+
+        IF 1 = $2 THEN
+            INSERT INTO searchByTitle
+                SELECT RecordId
+                FROM Books
+                WHERE Title LIKE CONCAT('%', $4, '%');
+        END IF;
+
+        IF 1 = $3 THEN
+            INSERT INTO searchByAuthor
+                SELECT RecordId
+                FROM Books b
+                    INNER JOIN ParticipantBookActions pab
+                        ON b.RecordId = pab.BookId
+                    INNER JOIN Participants p
+                        ON pab.ParticipantId = p.RecordId
+                WHERE p.ParticipantName LIKE CONCAT('%', $4, '%');
+        END IF;
+
+        SELECT *
+            FROM Books
+            WHERE RecordId IN (
+                SELECT DISTINCT b.RecordId
+                    FROM (
+                        SELECT RecordId
+                            FROM SearchByKeyword
+                        UNION
+                        SELECT RecordId
+                            FROM SearchByTitle
+                        UNION
+                        SELECT RecordId
+                            FROM SearchByAuthor) b);`, [
+        searchCriteria.searchByAuthor,
+        searchCriteria.searchByTitle,
+        searchCriteria.searchByKeyword,
+        searchCriteria.searchTerms])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function PurgeParticipantBookActionOrphans (res, bookId, recordIdList) {
+    return pool.query(`
+        DELETE FROM BroseyEnterpises.ParticipantBookActions
+            WHERE BookId = $1
+                AND RecordId NOT IN ($2);`, [
+        bookId,
+        recordIdList])
+        .then(dbres => {
+
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadParticipantRoles (res) {
+    return pool.query(`
+        SELECT role
+            FROM BroseyEnterprises.ParticipantRoles;`, [])
+        .then(dbres => {
+            var item = [];
+            dbres.rows.forEach((r) => {
+                item.push(r.role);
+            });
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function LoadBookStatusValues (res) {
+    return pool.query(`
+        SELECT Status
+            FROM BroseyEnterprises.BookStatus;`, [])
+        .then(dbres => {
+            var item = [];
+            dbres.rows.forEach((r) => {
+                item.push(r.status);
+            });
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+// End Brosey Enterprises Item Catalog
+
+// Begin Brosey Enterprises Gedcom Browser
+
+router.post('/gedcombrowser/loadgedcomfilelist/', isAdmin, function(req, res, next) {
+    LoadGedcomFileList(res);
+});
+
+router.post('/gedcombrowser/removegedcomfile/', isAdmin, function(req, res, next) {
+    DeleteGedcomFile(res, req.body.gedcomfileid);
+});
+
+router.post('/gedcombrowser/uploadgedcomfile/', isAdmin, function(req, res, next) {
+    UploadGedcomFile(res, req);
+});
+
+function DeleteGedcomFile (res, gedcomfileid) {
+    return pool.query(`
+        DROP SCHEMA IF EXISTS (
+            SELECT schema_name
+                FROM information_schema.schemata
+                WHERE schema_name = (
+                    SELECT schema
+                        FROM BroseyEnterprises.GedcomFiles
+                        WHERE RecordId = $1) CASCADE;
+        DELETE FROM BroseyEnterprises.GedcomFiles
+            WHERE RecordId = $1;`, [gedcomfileid])
+        .then(dbres => {
+            res.sendStatus(200);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function InsertGedcomFile (res, req) {
+    
+}
+
+function LoadGedcomFileList (res) {
+    return pool.query(`
+        SELECT RecordId,
+            Filename,
+            Hash,
+            Description,
+            FamilySchemaName,
+            UploadStatusId,
+            DateTimeUploaded,
+            DateTimeModified
+            FROM BroseyEnterprises.GedcomFiles;`, [])
+        .then(dbres => {
+            var item = dbres.rows;
+            res.send(item);
+        }).catch(e => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        });
+}
+
+function UploadGedcomFile (res, req) {
+    new formidable.IncomingForm().parse(req)
+        .on('field', (name, field) => {
+            console.log('Field', name, field);
+        }).on('fileBegin', (name, file) => {
+            file.path = "/home/pi/Documents/gedcom/" + file.name;
+        }).on('file', (name, file) => {
+            console.log('Uploaded file', name, file);
+        }).on('error', (err) => {
+            console.log(e.stack);
+            res.sendStatus(500);
+        }).on('end', () => {
+            //return InsertGedcomFile()
+            res.sendStatus(200);
+        });
+
+    //console.log(req.file);
+    //console.log(req.body);    
+    //return pool.query(`
+    //    SELECT 1=1`, [])
+    //    .then(dbres => {
+    //        res.sendStatus(200);
+    //    }).catch(e => {
+    //        console.log(e.stack);
+    //        res.sendStatus(500);
+    //    });
+}
+
+// End Brosey Enterprises Gedcom Browser
+
+module.exports = router;
